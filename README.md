@@ -21,6 +21,7 @@
 - **业务分流**：针对 AI、视频、下载、开发等不同场景优化路由规则
 - **配置驱动**：所有规则、标签、分组策略均可通过配置文件维护，无需修改核心逻辑
 - **容错回退**：节点池为空时自动回退到其他可用池，确保配置始终可用
+- **连接日志记录**：提供 Python 脚本监听 Clash API，自动记录连接信息和日志到 SQLite 数据库
 
 ## 📦 版本说明
 
@@ -311,6 +312,127 @@ const POLICY_TARGET = {
 2. **节点命名**：确保机场节点名称包含关键词（如"美国"、"VIP"、"AI专用"等），以便正确识别
 3. **规则顺序**：规则按 `RULE_ORDER` 数组顺序生效，优先级从高到低
 4. **兼容性**：仅支持支持 JavaScript 覆写的 Clash 客户端
+
+## 📊 连接日志记录工具
+
+项目提供了 `src/log/` 目录下的日志记录工具，用于监控和记录 Clash 的连接信息。
+
+### 功能特性
+
+- **实时监听**：通过 WebSocket 监听 Clash API 的连接和日志流
+- **SQLite 存储**：将所有连接信息和日志写入 SQLite 数据库，便于后续分析
+- **单例保护**：使用 Windows Mutex 和锁文件机制，确保全局只有一个实例运行
+- **后台运行**：支持以隐藏窗口模式运行，不干扰日常使用
+- **自动重连**：WebSocket 断开后自动重连，保证数据完整性
+- **可扩展性**：支持改造为云数据库方案，添加设备 ID 字段即可实现团队级流量监控与分析
+
+### 文件说明
+
+#### clash_logger.py
+
+核心的日志记录器，主要功能：
+
+1. **连接监控**：每 2 秒轮询 `/connections` API，捕获活跃连接和已关闭连接
+2. **日志监听**：通过 WebSocket 订阅 `/logs` 端点，实时记录 Clash 日志
+3. **数据存储**：
+   - `connections` 表：记录连接的完整信息（源/目标 IP、端口、进程、规则链、流量等）
+   - `logs` 表：记录 Clash 的运行日志（时间、类型、内容）
+4. **优雅退出**：Ctrl+C 停止时自动保存所有活跃连接的关闭时间
+
+**依赖安装**：
+```bash
+pip install websockets aiohttp
+```
+
+#### run.ps1
+
+Windows PowerShell 启动脚本，提供：
+
+1. **重复运行检测**：通过锁文件检查是否已有实例在运行
+2. **进程验证**：检查锁文件中 PID 对应的进程是否存活
+3. **自动清理**：检测到过期锁文件时自动清理
+4. **隐藏窗口**：使用 `pythonw.exe` 以无窗口模式运行
+5. **友好提示**：显示启动状态和数据库路径
+
+**使用方法**：
+```powershell
+# 直接运行
+.\run.ps1
+
+# 或在 PowerShell 中执行
+powershell -ExecutionPolicy Bypass -File run.ps1
+```
+
+### 数据库结构
+
+#### connections 表
+
+| 字段 | 说明 |
+|------|------|
+| id | 连接唯一标识 |
+| network | 网络类型（tcp/udp） |
+| type | 连接类型 |
+| host | 目标域名 |
+| destinationIP | 目标 IP |
+| destinationPort | 目标端口 |
+| sourceIP | 源 IP |
+| sourcePort | 源端口 |
+| process | 发起进程的进程名 |
+| processPath | 进程完整路径 |
+| remoteDestination | 远程目标地址 |
+| upload | 上传流量（字节） |
+| download | 下载流量（字节） |
+| start_time | 连接开始时间 |
+| close_time | 连接关闭时间 |
+| duration_s | 连接持续时间（秒） |
+| chains | 代理链（JSON 数组） |
+| rule | 匹配的规则 |
+| rulePayload | 规则负载 |
+| inboundName | 入站名称 |
+
+#### logs 表
+
+| 字段 | 说明 |
+|------|------|
+| id | 自增主键 |
+| time | 日志时间 |
+| type | 日志类型（info/warning/error/debug） |
+| payload | 日志内容 |
+
+### 使用场景
+
+1. **流量分析**：统计各应用的流量使用情况
+2. **规则调试**：查看哪些连接匹配了哪些规则
+3. **异常排查**：通过日志定位连接失败原因
+4. **性能优化**：分析连接持续时间和流量分布
+5. **审计记录**：保留完整的网络连接历史
+
+### 注意事项
+
+1. **Clash API 配置**：确保 Clash 客户端开启了 External Controller（默认端口 9090）
+2. **数据库路径**：如需修改数据库位置，编辑 `clash_logger.py` 中的 `DB_PATH` 常量
+3. **FlClash 兼容**：默认配置针对 FlClash 客户端，其他客户端可能需要调整路径
+4. **权限要求**：首次运行可能需要管理员权限访问 Clash API
+5. **资源占用**：长时间运行会累积大量数据，建议定期清理或归档旧数据
+
+### 数据查询示例
+
+```sql
+-- 查看最近 10 条连接记录
+SELECT * FROM connections ORDER BY start_time DESC LIMIT 10;
+
+-- 统计某进程的总流量
+SELECT process, SUM(upload + download) as total_bytes 
+FROM connections 
+GROUP BY process 
+ORDER BY total_bytes DESC;
+
+-- 查找访问特定域名的连接
+SELECT * FROM connections WHERE host LIKE '%openai.com%';
+
+-- 查看错误日志
+SELECT * FROM logs WHERE type = 'error' ORDER BY time DESC;
+```
 
 ## 🤝 贡献
 
